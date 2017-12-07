@@ -1,0 +1,1169 @@
+
+Garbage collection module for C++
+===================================
+
+This package provides a garbage collector and memory allocation system
+for C++. It works alongside of regular malloc which is unmanaged memory
+so you can have a mix of managed objects and non-managed objects.
+
+To make an object managed you must
+
+1. Make the class inherit from gcobj either directly or indirectly - inherit
+from another managed class.
+
+2. Write a gc_walker function for the class that walks through all
+pointers to managed objects except for weak pointers.
+
+If a pointer is not pointing to a managed object but points to a class
+that directly or indirectly have managed pointers you must handle
+that too. This can be done by writing a gc_walker function for that
+non-managed class and call it directly from the object that has pointer
+to your non-managed object. Unmanaged objects will normally never move so
+that pointer doesn't have to be updated but you can call gc_walker to update
+any managed pointers in it.
+
+I said "normally" because if you places such an object as a member of
+a managed object it will of course move. If so you do not have any pointer
+to it so there's nothing to update as such but GC keep track of where
+the object is and updates its registration when this happens.
+
+3. Register zero or more root level pointers.
+
+4. Register zero or more top level objects. These are non-managed objects
+that is defined statically or globally or in some other permanent memory
+and contain pointers to managed objects. These have to have a static
+gc_walker function defined for it and if the class or struct is called
+TopLevel it is defined similar to this:
+
+alf::gc::data<TopLevel> top;
+
+This allows GC to use top as a top level object and start gc_walk from there.
+
+From then on you can do exactly as you would in a regular garbage collecting
+language. Create objects, and set their pointer to null to remove the
+objects.
+
+
+----------------------
+
+It is based upon co-operation between this package and the user.
+
+It provides you with the ability to freeze objects and also support
+weak pointers.
+
+It allows you to create objects and let the GC take care of removing them
+when they are no longer reachable by any pointer (ignoring weak pointers).
+
+The idea of weak pointers is that they point to an object but does not
+count as a pointer when looking for reachable objects. If an object has
+only weak pointers pointing to it, it will be reclaimed and the weak
+pointers will be set to null value.
+
+One example is a map of all strings indexed by a hash value. This map
+is typically of weak pointers so that if a string has no pointer other
+than the one from the map it will be removed. In this case the map
+object might want to know when the object is removed and
+so it should install a callback into the GC. The callback is
+a simple callback that is called every time an object is removed and
+a weak pointer is set to null pointer. Then you can check if it is
+one of your pointers and perform an action - for example remove the
+element from the map - no point to have an element with a null pointer
+in it. This callback is achieved by GC calling the destructor for
+the gcobj object when it removes it and this destructor can then
+contain code to notify the map that the element is gone.
+
+The co-operation also consists of the user adhering to certain conventions.
+
+1. Any object derived from gcobj (including objects that derive from some
+other object that eventually derive from gcobj) can only reside on heap and
+created by new. If you use multiple inheritance, it is enough that one of
+the baseclasses derives from an object that has gcobj in its ancestry.
+
+DO NOT attempt to have multiple managed base classes. It won't work. Virtual
+won't save you. Write an object with one managed baseclass and if you need
+others, have pointers in the object to those others and create them
+in constructor or what have you.
+
+I.e. the following is a big no no.
+
+class Foo : public alf::gc::gcobj { .... };
+class Bar : public alf::gc::gcobj { .... };
+class Baz : public Foo, public Bar { .... }; // WILL NOT WORK.
+Making one or more of the base classes virtual or making
+alf::gc::gcobj virtual will not work - on the whole do not attempt
+to write:
+
+class Foo : public virtual alf::gc::gcobj { .... }; // WILL NOT WORK.
+
+This is because most compilers implement virtual base classes by
+having the baseclass placed behind the object and a pointer in the beginning
+of the derived class points to it. However, GC insists that gcobj should
+be at the beginning of the object and so virtual baseclasses WILL fail every
+time.
+
+Do NOT attempt to put any managed object on stack or inside other objects.
+Rather create a pointer and create an object on heap by calling new to
+create the object.
+
+I.e. the following is a big no no:
+
+class Foo : public alf::gc::gcobj { .... };
+
+void func()
+{
+    Foo f; // This will fail.
+    .....
+}
+
+static Foo f; // This will fail too.
+
+// in Global memory:
+Foo f; // This will fail as well.
+
+On the whole, for a managed class you should ALWAYS use pointers, i.e.
+
+Foo * f; // ok anywhere (*)
+pointer<Foo> f; // absolutely ok anywhere.
+weak_pointer<Foo> f; // also ok anywhere.
+
+(*) It is ok as such but beware that if this is a top level pointer
+that is not inside an object covered by a gc_walker that is callable
+by GC it will act as a weak pointer except that it isn't a weak pointer
+and GC will not update the value when the object is reclaimed or
+moved. Thus you may end up with a dangling pointer.
+
+2. Every class that derives from gcobj must implement a function called
+gc_walker with the following signature:
+
+void Klass::gc_walker(const std::string & txt);
+
+The body of that class consists of calls to alf::gc::gc_walk(text, ptr) for
+every non-weak gcobj pointer in the class. By gcobj pointer I mean a pointer
+to a class that has gcobj in its ancestry. This also includes the case
+that your class has a pointer to a non-gcobj object which in turn has
+pointers to gcobj. In this case you cannot do gc_walk directly but has to
+follow that pointer and do gcobj on the gcobj pointer in that object.
+
+3. The user must register some top level or root pointer or pointers that
+defines which objects are reachable to the user. This is typically a static
+or global pointer that is (semi-)permanent. Instead of a single pointer you
+may also have a top level object that contains multiple pointers and that
+top level object is not gcobj as it typically is stored on stack or is static.
+GC support both these and there is no either-or here you can use both in
+the same program. You can register multiple root pointers and multiple
+top level objects. GC will then go through all of them and look for
+reachable objects and then garbage collect any that aren't reachable through
+any of those pointers.
+
+To create a root pointer use the alf::gc:pointer<Foo> ptr("text") rather than
+Foo * ptr as that will automatically register the root pointer as such.
+
+To create a top level data object use alf::gc::data<Foo> foo("text");
+If Foo has constructor arguments supply them after the text:
+alf::gc::data<Foo> foo("text", args...);
+
+Also, to make this work you have to declare and define a gc_walker for
+Foo - as Foo is not a gcobj this is not virtual and should rather be
+static for data<> to work. However, for other reasons you might want
+a non-static gc_walker so you can declare both:
+
+struct Foo {
+    Bar * ptr; // a gcobj pointer.
+    Bar * ptr2; // another.
+
+    void gc_walker(const std::string & txt);
+    static void gc_walker(const std::string & txt, Foo & f);
+}
+
+When you have two gc_walkers like this let the static one call the other:
+
+// static
+void Foo::gc_walker(const std::string & txt, Foo & f)
+{ f.gc_walker(txt); }
+
+void Foo::gc_walker(const std::string & txt)
+{
+   alf::gc::gc_walk(txt + ".ptr", ptr);
+   alf::gc::gc_walk(txt + ".ptr2", ptr2);
+}
+
+There are more nuances. For example instead of having a single pointer
+you might have a std::list<Bar *> or vector or other container of pointers,
+if so iterate through the list and call gc_walk on each pointer in the list.
+An example of that is in the next section about weak pointers where the
+gcobj has a list of children.
+
+Regarind weak pointers.
+-----------------------
+
+THe key point for weak pointers is that you should declare them like this:
+
+alf::gc::weak_pointer<Foo> weak_ptr = 0;
+
+instead of
+
+Foo * weak_ptr = 0;
+
+and if your object have any weak pointers you should ignore them
+when writing the gc_walker function for your class. It is the point of
+weak pointes that you do not follow them to detect reachable objects since
+an object that is only accessed through weak pointers are supposed tobe
+reclaimed by the garbage collector and the weak pointer should be set to 0
+by the GC module when it does that.
+
+Having the weak pointers declared as weak_pointer<Foo> rather than Foo *
+also ensures that you do not accidently gc_walk the weak pointer - there
+is a specialization for weak pointers that do nothing for gc_walk.
+
+So if you have:
+
+class Foo : public alf::gc::gcobj {
+public:
+   /* public interface here */
+
+   virtual void gc_walker(const std::string & txt);
+
+private:
+   alf::gc::weak_pointer<Foo> parent;
+   std::list<Foo *> children;
+};
+
+and you write:
+void Foo::gc_walker(const std::string & txt)
+{
+  char buf[40];
+  alf::gc::gc_walk(txt + ".parent", parent); // This works.
+  std::list<Foo *>::iterator p = children.begin();
+  int k = 0;
+  while (p != children.end()) {
+     sprintf(buf, ".children[%d]", k++);
+     alf::gc::gc_walk(txt + buf, *p);
+     ++p;
+  }
+}
+
+As parent is a weak pointer you really shouldn't do gc_walk on it, but
+this still works ok because gc_walk on weak pointers does nothing.
+
+===========
+
+Assume you have three classes that looks like this:
+
+class Foo {
+public:
+   /* public interface here */
+
+private:
+
+   Bar * aptr;
+   Baz * bptr;
+};
+
+class Bar {
+public:
+   /* public interface here */
+
+private:
+   Foo * fooptr;
+   Bar * anotherbar;
+   Baz * bazptr;
+};
+
+class Baz {
+public:
+    /* public interface here */
+
+private:
+   Foo * fooptr;
+   Bar * barptr;
+};
+
+Let's assume that you also have a root object that contain a pointer
+to the root structure. This object will reside on stack or in global memory
+and will not be allocated on heap.
+
+class TopLevel {
+public:
+   /* public interface here */
+private:
+   Foo * fooptr;
+   Baz * curbaz;
+};
+
+Now, let's assume you want to allocate Foo on heap and you want to make
+use of this garbage collector to keep track of it.
+
+Then you have to write the following virtual member function in Foo:
+
+class Foo : public alf::gc::gcobj {
+public:
+   /* public interface here */
+
+   virtual void gc_walker(const std::string & txt);
+
+private:
+
+   Bar * aptr;
+   Baz * bptr;
+};
+
+and that function has to have a body like below. For the moment we assume
+that neither Bar nor Baz will be garbage collected.
+
+// virtual
+void Foo::gc_walker(const std::string & txt)
+{
+  alf::gc::gc_walk_not_gcobj(txt + ".aptr", aptr);
+  alf::gc::gc_walk_not_gcobj(txt + ".bptr", bptr);
+}
+
+This is because although Foo has no pointer to gc objects, it has pointers
+to Bar and Baz and each of those have a Foo pointer, so we have to
+"walk" them to reach all reachable objects.
+
+Now, in Bar and Baz you then have to implement a gc_walker for those as
+well. These functions do not have to be virtual. Also, the one in Foo does
+not have to have 'virtual' attached to it since it will be automatically
+virtual since the baseclass alf::gc::gcobj has a pure virtual function with
+that signature.
+
+So we write a function for Bar:
+
+class Bar {
+public:
+   /* public interface here */
+
+   void gc_walker(const std::string & txt);
+
+private:
+   Foo * fooptr;
+   Bar * anotherbar;
+   Baz * bazptr;
+};
+
+void Bar::gc_walker(const std::string & txt)
+{
+   alf::gc::gc_walk(txt + ".fooptr", fooptr);
+   alf::gc::gc_walk_not_gcobj(txt + ".anotherbar", anotherbar);
+   alf::gc::gc_walk_not_gcobj(txt + ".bazptr", bazptr);
+}
+
+Notice the first of these - it has to be written like that and it
+is important that you give the pointer as argument. Do not copy it
+to a temporary variable and pass it along. gc_walk will update the
+pointer if the object has moved by the garbage collector.
+
+It doesn't matter if several pointers point to the same object, for gc
+objects, the garbage collector will detect that it has already seen
+this object and do the sensible thing.
+
+If the class Bar contained a Baz object rather than a pointer to it,
+the code is essentially identical:
+
+class Bar {
+public:
+   /* public interface here */
+
+   void gc_walker(const std::string & txt);
+
+private:
+   Baz bazobj;
+   Foo * fooptr;
+   Bar * anotherbar;
+};
+
+void Bar::gc_walker(const std::string & txt)
+{
+   alf::gc::gc_walk(txt + ".fooptr", fooptr);
+   alf::gc::gc_walk_not_gcobj(txt + ".anotherbar", anotherbar);
+   alf::gc::gc_walk_not_gcobj(txt + ".bazobj", bazobj);
+}
+
+Similar code must be written for Baz::gc_walker:
+
+void Baz::gc_walker(const std::string & txt)
+{
+   alf::gc::gc_walk(txt + ".fooptr", fooptr);
+   alf::gc::gc_walk_not_gcobj(txt + ".barptr", barptr);
+}
+
+Also, these texts that you pass along are used when writing error
+messages so that you can get the full path to the pointer that it went
+through to detect the problematic situation. For example if you have
+a dangling pointer situation which can happen if you delete an object and
+you have other pointers pointing to the object you just deleted. Then
+the error message will contain the full path from a root pointer to
+where the dangling pointer can be found. Using sensible names of pointers
+will then allow you to pinpoint which code may be problematic.
+
+GC will also need to know where to start looking for objects. That is
+you must register a top level root pointer or pointers. This can be done
+in several ways:
+
+1. Simply register a pointer and declare it to be a root pointer. This
+pointer should be somewhere in permanent memory (permanent as long as
+the system is using it) and should be unregistered before the pointer
+goes away. This can be done by:
+
+Foo * root_ptr = 0;
+
+
+and then in some init code:
+void init_root_ptr()
+{
+   alf::gc:register_ptr("root_ptr", root_ptr);
+}
+
+If you have a pointer on stack in a function it is easier to use:
+
+alf::gc::pointer<Foo> root_ptr("root_ptr");
+
+This pointer registers itself upon construction and then automaticaly
+unregisters itself upon destruction for example when the function returns.
+
+If you for some reason have to use default constructor, a pointer object
+does not register itself automatically and you must do it yourself as
+early as you can:
+
+alf::gc::pointer<Foo> root_ptr;
+
+root_ptr.gc_register("root_ptr");
+
+If you for whatever reason want to unregister the root pointer before the
+pointer object is removed you can do:
+
+root_ptr.gc_unregister();
+
+If you want to make sure that all registrations of this pointer goes away:
+root_ptr.gc_unregister_all();
+
+Other than that, the object works just like a pointer and take exactly
+the same space as a pointer, you will typically not use it as arguments
+to functions except as reference arguments though since making lots of
+copies of pointer objects around will generally not be useful. They do not
+register unless you provide a text string upon construction so just copying
+a pointer object to another will not cause it to register but some programmer
+reading your code may think the pointer is registered when it really isn't
+and that's a bad idea.
+
+However, in our case we don't have a single root pointer, we have a
+top level object and you could replace the two pointers in that object
+with a pointer object each:
+
+class TopLevel {
+public:
+   /* public interface here */
+private:
+   alf::gc::pointer<Foo> fooptr;
+   alf::gc::pointer<Baz> curbaz;
+};
+
+but - and in particular if you have many of them - a better idea is
+to allow gc to start walking on the top level object instead. This
+object is not managed by the garbage collector so we can do it as follows:
+
+Say, you have a top level object on stack in main or in some global memory
+or as a static member somewhere:
+
+TopLevel top;
+
+Then step 1 we need to define a gc_walker function for this top level
+object. This gc_walker must be declared static and takes two arguments -
+a string and a pointer or reference to the top level object. In the
+case that you have a top level object it is best to use the
+reference argument version:
+
+so we change TopLevel to this:
+
+class TopLevel {
+public:
+   /* public interface here */
+
+   static void gc_walker(const std::string & txt, TopLevel & d);
+
+private:
+   Foo * fooptr;
+   Baz * curbaz;
+};
+
+Now, we can register top as a toplevel object:
+
+void init()
+{
+   alf::gc::register_obj("top", top, TopLevel::gc_walker);
+}
+
+Note, if the gc_walker function had a pointer to TopLevel instead - use:
+
+alf::gc::register_obj("top", & top, TopLevel::gc_walker);
+
+This is more useful if you instead of a top level object have a pointer
+to a top level object:
+TopLevel * topptr;
+alf::gc:register_obj("topptr", topptr, TopLevel::gc_walker);
+
+In this case the gc_walker has a pointer to the top level object as argument.
+
+Alternatively, if gc_walker has a reference argument you must use:
+alf::gc::register_obj("top", *topptr, TopLevel::gc_walker);
+
+Be aware that this case will crash if the top level ptr is 0 as it receives
+a reference and will not check if ptr is 0.
+
+Back to our case with a top level object and a reference argument - 
+the gc_walker function can be written like this:
+
+// static
+void TopLevel::gc_walker(const std::string & txt, TopLevel & data)
+{
+   alf::gc::gc_walk(txt + ".fooptr", data.fooptr);
+   alf::gc::gc_walk_not_gcobj(txt + ".barptr", data.barptr);
+}
+
+Again, this can be made easier by declaring top as:
+
+alf::gc::data<TopLevel> top("top");
+
+Again, if top cannot take arguments and you have to use default constructor
+you can do register after creation:
+
+alf::gc::data<TopLevel> top;
+
+void init()
+{
+    top.gc_register_obj("top");
+}
+
+top's destructor will unregister the object.
+
+If top has additional arguments to constructor these comes after the text:
+
+class TopLevel {
+public:
+   TopLevel(float x, const char * str);
+   ....
+};
+
+alf::gc::data<TopLevel> top("top", 3.14, "hello");
+
+In this case you have to register the object. It doesn't make sense that
+you pass arguments to constructor but do not register it to gc. The
+gc_register_obj is provided for the case that you cannot provide arguments
+to constructor and have to register the object at a later time.
+
+The third way is a bit sneaky. A side effect of freezing an object is that
+it will always be accessible even if there are no pointers pointing to it.
+Thus, gc will also walk through all frozen objects and act as if they are
+top level objects and any objects reached from them are visible and will
+not be garbage collected.
+
+So say you have a Foo object as your top level object, then simply freeze this
+and you're in business! Of course, if you set the pointer to 0 and forget it
+you can not reach it any more but as it is frozen it will stay in memory and
+be used as a top level object. I will not really recommend this solution,
+the above two using the pointer<> and data<> templates should really cover
+all possibilities.
+
+What if you have gc object pointers not directly but in a list?
+
+Consider this:
+
+class Foo : public alf::gc::gcobj {
+public:
+   /* public interface here */
+
+   virtual void gc_walker(const std::string & txt);
+
+private:
+
+   std::list<Foo *> L_;
+};
+
+The object has an STL list of Foo ptrs.
+
+// virtual
+void Foo::gc_walker(const std::string & txt)
+{
+   char buf[40];
+
+    std::list<Foo *>::iterator p = L_.begin();
+   int k = 0; // to give meaningful index for list entry.
+   while (p != L_.end()) {
+      sprintf(buf, ".L_[%d]", k++);
+      alf::gc::gc_walk(txt + buf, *p);
+   }
+}
+
+Again, it is important that you give *p as argument, i.e. the *iterator
+as that will be a reference to the pointer so that gc_walk can update
+the pointer if the object has moved.
+
+Similar considerations can be done for maps, vectors and so on as well
+as your own defined list objects:
+
+If instead of std::list you have used something like this:
+
+class Foo : public alf::gc::gcobj {
+public:
+   /* public interface here */
+
+   virtual void gc_walker(const std::string & txt);
+
+private:
+
+   struct node {
+      node * next;
+      Foo * f;
+   };
+
+   node * first;
+   node * last;
+};
+
+Then you can write gc_walker like this:
+
+// virtual
+void Foo::gc_walker(const std::string & txt)
+{
+   char buf[40];
+   node * p = first;
+   int k = 0;
+   while (p) {
+       sprintf(buf, ".foolist[%d]", k++);
+       alf::gc::gc_walk(txt + buf, p->f);
+       p = p->next;
+   }
+   // last pointer should only point to the same object
+   // that we already walked through by walking the list
+   // so we don't have to walk that object.
+   // If last might point to some object not yet walked you
+   // must walk that too:
+   p = last;
+   k = 0;
+   while (p) {
+       sprintf(buf, ".foolist_last[%d]", k++);
+       alf::gc::gc_walk(txt + buf, p->f);
+       p = p->next;
+   }
+}
+
+You might want to say it is an error that last->next != 0
+but you should walk it anyway if there is an obj there.
+
+Failure to walk a pointer that points to an object that isn't
+reached by any other pointer means that the garbage collector
+will remove the object while your pointer is still pointing to it.
+
+A similar consideration is for pointers that point to objects but
+where the pointer is not registered as a top level pointer nor
+is it in an object that is processed by gc by a suitable gc_walker
+function. You risk that gc believes there are no pointers to this
+object and removes it and your pointer is then a dangling pointer.
+
+You should therefore be careful when using lots of temporary variables
+to hold pointers and maybe replace some of them with pointer<T> instead
+so that you get them registered as a top level pointer so that they
+are visible to gc.
+
+I already mentioned that objects can be frozen. This is in case you want
+to pass an object to another module perhaps written in another language
+and that module assumes that an object stays in place and does not move
+around. If so, freeze the object - it might be moved to a separate location
+and stay there until unfrozen. You can still delete the object but gc will
+not delete it on its own. The freeze operation will possibly move the object
+but will then keep it at that location. Even if you freeze an already frozen
+object it will stay in place until you have unfrozen it as many times as you
+originally froze it.
+
+I.e. if you freeze an object 4 times you have to unfreeze it 4 times before
+it is actually unfrozen and moved back to the normal gc memory.
+
+The inner workings of gc:
+
+Internally in gc we have 4 pools and several instances of minipools.
+
+First off there is the GCpool which is the pool that you normally allocate
+objects from. Objects in GCpool move around when you do a gc(). GCpool has
+two minipools and it alternates between them. One pool is the active pool
+and any allocations appear in active pool. When you do a gc() it will swap
+active pool and the other pool and then walk through the other pool and find
+any live objects in it and move them to active pool. Any other objects will
+be garbage collected.
+
+Second pool is Fpool which is the frozen pool It has 1 or more minipools.
+Since we don't move objects we do not enlarge the minipools for Fpool but
+instead create a new pool and add it to our list whenever we need more space.
+Objects in Fpool do not move around but stay where they are until unfrozen
+at which case they move back to GCpool.
+
+Third pool is Lpool which is used for large objects. If you allocate an object
+that is large (>= large_size - a variable in GC which can be read/set)
+then instead of allocating the object in GCpool we allocate it from Lpool
+instead. Lpool objects are garbage collected but never move around. They are
+like frozen even when not frozen in that respect.
+
+Lpool actually have no data storage on its own, instead it has a vector
+containing pointers to each gcobj that it has allocated. If an object is
+removed it is removed from that vector but it stays where it is. Lpool is
+assumed to hold huge data objects so moving them around is not practical.
+
+PtrPool is a pool that holds the pointers you register as root pointers.
+It holds a pointer to the pointer (gcobj **) and a text for each pointer.
+
+FPtrPool is the final pool and holds a similar vector of data objects
+text strings and the associated gc_walker function to cover the top level
+data objects you register.
+
+This is what gc does:
+
+1. Set other pool active and the formerly active pool as "other".
+"Other" will now hold all the objects allocated while active is empty.
+
+2. Walk through PtrPool and visits each object visible from PtrPool
+by calling gc_walk on each pointer found in there that is not 0. I.e.
+The function will examine the pointer and and check the object it points
+to and decide what to do. For a regular GCpool object this means moving
+it to the active pool and update the pointer to point to the new location
+and call gc_walker() on the object to reach further objects.
+
+3. Similarly, walk through FPtrPool and call the registered function
+for each registered data object providing the text as argument.
+
+4. Similarly walk through Fpool and do gc_walk on each object
+found there. The object will not be moved but we will call gc_walker
+to reach further objects.
+
+5. We also need to walk through Lpool and walk any that are frozen.
+
+6. By now we have seen all visible objects. Any objects not yet seen
+are to be removed by garbage collector except for frozen objects which
+aren't removed even if not seen. (this is ensured by step 4 so that any
+objects in Fpool are always deemed visible).
+
+7. Walk through GCpool other minipool and remove any objects found in there.
+Their destructor is called. The minipool is then marked empty and ready
+to be the next active on next gc::gc(). All live objects are already in
+the currrently active minipool and pointers to them are updated during
+the steps 2-4 above.
+
+8. We also walk through Fpool but only to clear the "visited" mark on
+each object. This is because gc steps 2-4 assumes the visited bit is
+already clear so we do not want to have that mark on while gc::gc() is not
+running.
+
+9. Similarly, walk through Lpool and remove any objects that are not
+marked as visited or frozen by any of the steps 2-4.
+
+Calling gc::gc() WILL move all objects in normal GCpool.
+
+Objects allocated in the minipools as well as the objects allocated by
+Lpool are done by allocating a block that contains a HEAD before the object
+and a TAIL after it. Currently, these HEAD and TAIL are quite large as we
+have a buffer between them and the user object in order to protect the head
+and tail from being corrupted by user. HEAD is 80 bytes while TAIL is 48 bytes.
+For a minimum solution the HEAD could be a lot smaller as could TAIL. TAIL
+in particular only contains two std::size_t items so it really is only 16 bytes
+long and the 32 bytes before it is buffer to prevent user from corrupting it
+if he for example accesses an array at end of its object with an index that
+is slightly over the limit.
+
+Also, each user area is at least large enough to hold three pointers so even
+if your object is only 12 bytes long you still get space enough in the block
+to hold a 24 byte object if pointers are 8 bytes (64 bit pointers).
+
+So for example if an object is exactly 16 bytes long (virtual pointer + 1
+pointer of data) then you allocate 80 bytes head + 24 bytes obj space and
+48 bytes of tail = 152 bytes but used space is only 16 bytes - so quite
+a lot of overhead. This can be reduced if needed although the current code
+does not allow for that.
+
+However, the requirement of at least 3 pointer user space and a minimal size
+of head and tail is hard to get around. If reducing overhead is a priority
+I can look into improving part of that code but some things are necessary.
+
+The minipools are simply array of data (p_) with a std::size_t holding the
+capacity (sz_) and another std::size_t holding the used area (usz_).
+
+p_ + usz_ marks the first free area of the minipool.
+p_ + sz_ marks the end of the minipool area.
+p_ marks the beginning of the area. p_..p_+usz_ is the already allocated
+part of the minipool and p_+usz_...p_+sz_ marks the available region.
+
+Allocating an object in the free area of the minipool means first figuring
+out how large the block we allocate is and then see if the free area is
+at least this large. If not  we fail - For GCpool this will trigger a gc::gc()
+or if we already tried that enlarging the pool which will also trigger a
+call to gc::gc(). Note that the two pools in GCpool are normally always the
+same size or if different the active pool is always larger than the other
+pool. I.e. if you have an object you want to move from other to active there
+is guaranteed room in the active pool for it, so such allocation should never
+trigger a gc::gc().
+
+Then the new block starts at p_ + usz_ and we update usz_ with the block
+size so that this region is claimed for that block. We initialize the block
+by initializing the head and the tail and then we return a pointer to the
+user part of the block (end of header) to the user.
+
+Similarly in Fpool - the block looks exactly the same except that the block
+is marked as a frozen object rather than regular GC object.
+
+It is also the same in Lpool where the object allocated have a head and
+a tail before the object. This means that every object allocated by
+gc have a head and a tail before and after itself. This means that
+we can take a gcobj pointer and cast it to a head pointer and find the head
+pointer to the block from there. If obj is a pointer to the user object
+then
+
+head * h = reinterpret_cast<head>(obj) - 1;
+
+Gives us a pointer to the head of the block and we can find out what kind
+of object this is, what pool created it, what state it is in and so on.
+
+Some thoughts about the motivation for this garbage collector
+-------------------------------------------------------------
+
+The original idea was simple: Use C++ virtual function mechanism to detect
+objects that has moved and objects that has been removed from the heap by
+declaring an object like this:
+
+class moved : public gcobj {
+public:
+   gcobj * moved_to;
+
+   virtual gcobj * gc_walker();
+};
+
+In this original scheme, gc_walker returned a pointer to where the object
+has moved to, so:
+
+gcobj * moved::gc_walker() { return moved_to; }
+
+Since moved to means the object has already been moved - and thus seen -
+by a previous pointer we do not need to recurse into the object
+but just return the pointer where the object has moved to so that the
+pointer can be updated.
+
+Similarly, an object that has been removed can be similarly handled:
+
+gcobj * removed::gc_walker()
+{
+    return 0;
+}
+
+Although in this case you might want to catch the dangling pointer
+by doing:
+
+gcobj * removed::gc_walker()
+{
+    throw dangling_pointer("Dangling pointer detected");
+}
+
+Now, this scheme doesn't actually work that well. The problem is that
+upon first visit we want to move the object to the new active pool and
+then call gc_walker on the new location and while that can technically be
+done it is quite hairy to ask user to implement each function of gc_walker
+with this code - a better idea is to place a function inside gc that
+first examines the object and if found that it has moved return the pointer
+to the moved location and if it has been removed catch the error right
+there and if neither then move the object to the new heap and then call
+gc_walker on the already moved object. Next pointer that points to the
+same object will then detect that the object has moved and just update
+the pointer without calling gc_walker since we have already done that
+for this object (since the object is moved we know we have already seen it).
+
+Further, the error message for dangling pointer above leaves something
+to be desired - we would like to know which pointer is the dangling
+pointer, so I came up with the idea of passing a string along with
+the gc_walker function so that it can identify the pointers with
+full path from the root pointer and in user gc_walker functions you can
+provide any identifying marks of the object and pointer in question so
+that you can quickly find which pointers are dangling or whatever and you
+can fix the issue.
+
+Further, it is obvious that sometimes you allocate huge objects and it is not
+practical to move around a 5 MB object on a GC heap, so in this case you
+are better off with a special pool for large objects which effectively works
+in a manner similar to boehm GC in that the objects never move but they are
+still being watched by GC and if no pointers to them they are discarded just
+as GCpool objects.
+
+Large objects can also be frozen, they simply do not move around even when
+not frozen. Your program doesn't have to worry about if an object is in
+Lpool or GCpool, if you want to freeze the object - freeze it and when it
+doesn't have to be frozen any more - unfreeze it.
+
+We also need a pool to allow user to register root pointers that are used
+when walking through all reachable objects. Hence the PtrPool.
+
+And some times instead of a single pointer you have some data object stored
+on stack or somewhere that holds several root pointers and you want to
+walk all of them in an easy manner. Hence the FPtrPool.
+
+The pointer class is a wrapper for the PtrPool pointers and the data class
+is a wrapper class for the FPtrPool stuff.
+
+Additionally there are some exceptions defined, mostly the fatal_error which
+is used whenever gc detects something wrong (just about all errors are fatal
+errors in gc), dangling_pointer exception when we detect a dangling pointer
+and the gc_allocation_error used when you for whatever reason cannot allocate
+more memory.
+
+The gc_allocation_error instances are created before hand by initial program
+and then thrown when the condition is found. This is so that you do not
+attempt to allocate memory when you detect a memory allocation problem.
+
+The gc_walker scheme is actually quite powerful and allow you to
+detect and update every pointer used by user.
+
+If an object is not on heap it cannot have gcobj as baseclass as any gcobj
+object is assumed to be preceeded by a HEAD and succeeded by a TAIL.
+
+However, you can still use the object with GC:
+
+1. If the object is a root level object - i.e. it is stored in a global area,
+a static area or it is stored on the stack in a function that is likely to
+be active for a substantial part or the program (main or some other top level
+function), then using data<T> wrapper should cover it. Justy declare a static
+gc_walker function for the type. If the type is not defined by you there are
+several ways to get around that - one is to make a subclass that has the static
+function, by having the original class as a public parent class you don't
+lose any access or usability and can use your object just as you would the
+original object. If your subclass have no additional data the size of the
+object is the same as the original object so this works very well.
+
+Alternatively you can define a new object that contain the original object
+as a member and then create the static function for the new class and have
+it access the pointers of the provided class - if you need access to
+private members to do that, you will have to get access to the class itself.
+
+You can even define the function as a regular global function and in this
+case it doesn't have to have the name gc_walker but you will still need
+access to the pointers in question so if they are private you need some
+way to get that access. Simply call the gc_register_obj("str", data, func);
+where func is a void func(const std::string & txt, dataobj & data);
+to handle the dataobj class in question. Again, func need access to the
+pointers inside dataobj which is why a static member function works so well.
+
+For other objects you simply run through them in the object where the pointer
+to them are located, say a gcobj have a data * pointer named ptr that
+points to an object of type that is NOT a gcobj but it may in turn contain
+gcobj pointers.
+
+Then:
+
+void Klass::gc_walker(const std::string & txt)
+{
+   if (ptr) ptr->gc_walker(txt + ".ptr");
+}
+
+Would do the trick. Just declare a function gc_walker in data
+that is not static - it can be virtual that doesn't matter
+and it can in turn do gc_walk on ever gc_obj pointer and do
+a similar if (ptr) ptr->gc_wlaker(..) on further non-gcobj pointers.
+
+One final point. For gcobj we do:
+
+gc::gc_walk("some text", ptr);
+
+For non-gcobj objects we do:
+
+gc::gc_walk_not_gcobj("some text", obj_or_ptr);
+
+The "not gcobj" refers to the fact that obj or ptr references an object
+that does not have gcobj as its top level base class (ultimate ancestor).
+
+If your class has gcobj as baseclass you use the gc_walk, if your class
+has a baseclass that would use gc_walk, your class must use gc_walk too
+and it must have a gc_walker function defined. An exception is
+if your object contain no pointers at all or the pointers it has does
+not refer to objects involved in gc walking. Such objects are considered
+pure data objects as far as gc is concerned and you could define them
+as such:
+
+// First a pure data object without gcobj pointers.
+struct Foo {
+   int x;
+   std::string s;
+};
+
+
+class Bar : public gc::gcobj {
+public:
+   /* public interface here */
+   virtual void gc_walker(const std::strig & txt);
+
+private:
+   Foo * ptr;
+   Foo obj;
+   int y;
+};
+
+The class Bar contain a pointer but it is to an object that itself
+has no gcobj pointers nor pointers to any objects that contain gcobj pointers
+anywhere down the line. So Bar is a pure data object. You could write
+the gc_walker with an empty body but for this situation it is much better
+to redefine Bar like this:
+
+class Bar : public gc::gcdataobj {
+public:
+   /* public interface here */
+
+private:
+   Foo * ptr;
+   Foo obj;
+   int y;
+};
+
+Then you don't have to write any gc_walker function for this class - GC
+provides it for you, the gcdataobj::gc_walker function is simply an empty
+body that does nothing as there are no pointers to walk.
+
+
+While GC does support that you have classes that are not allocated in GC's heap
+you probably want as many as possible to be defined as gcobj classes. However,
+gcobj classes can not reside on stack or global memory, if you need a global
+or static gcobj object you have to define a global or static pointer and
+create the object before first use and use that pointer to access it. So if
+Foo is a gcobj object (it either inherits from gcobj or inherits from some
+other class that in turn inherits from gcobj and so on), then instead of doing
+
+static Foo foo;
+
+declare it as:
+
+static gc::pointer<Foo> fooptr = 0;
+
+static Foo & getfoo()
+{
+   if (fooptr == 0) fooptr = new Foo(....);
+   return *fooptr;
+}
+
+Now, the pointer is registered and you create the object when it
+is needed and users can then use:
+
+getfoo().some_member_function(....)
+
+to access it. This ensures that the object is allocated on GC heap as all
+gcobj objects should be.
+
+Also, do not override void * operator new(size_t sz) for any gcobj. This
+is defined to allocate the object on GC heap when you say
+
+new Foo(...)
+
+and should stay that way. For advanced use you COULD in theory override it
+provided the override calls the base class version to actually do the
+allocation. For example if you want your own suffix to the object
+you create you could write something like:
+
+void * Foo::operator new(std::size_t sz)
+{
+    void * p = gcobj::operator new(sz + EXTRA_SPACE);
+    // p now points to some space that has room for both a gcobj
+    // as well as additional data after the gcobj.
+    return p;
+}
+
+Note that you cannot have data BEFORE the object. GC assumes that the
+address delivered into p points to a gcobj object. However, using such
+a suffix allow you to allocate a variable length array as the last member
+of a class:
+
+class Foo : public gcobj {
+public:
+
+   static Foo * mk(int n, const int * arr);
+
+   int length() const { return n_; }
+   const int data() const { return reinterpret_cast<int *>(this + 1); }
+
+   int operator [] (int k) const
+   {
+	if (k < 0 || k >= n_) return -1; // or some other error return.
+	return data()[k];
+   }
+
+   int & operator [] (int k) const
+   {
+       if (k < 0 || k >= n_) throw some_error(...);
+       return data()[k];
+   }
+
+   void * operator new(std::size_t sz, int n);
+
+private:
+
+    int * wdata() { reinterpret_cast<int *>(this + 1); }
+
+    Foo(int n, const int * arr) : n_(n)
+    { std::memcpy(wdata(), arr, n*sizeof(int));  }
+
+    int n_;
+};
+
+void * Foo::operator new(std::size_t sz, int n)
+{ return gcobj:operator new(sz + n*sizeof(int)); }
+
+// static
+Foo * Foo::mk(int n, const int * arr)
+{
+   return new(n) Foo(n, arr);
+}
+
+This will work. Notice the "this + 1" expressions used to get a
+pointer to the end of the object.
+
+Making subclasses of Foo makes little sense - you can do it but make
+sure they do not contain any data as that means the this + 1 will
+access those data rather than the array. A fix to that would be
+to store the offset to the array start in the class and then it is just
+easier to have a pointer to the array or even better an std::vector<int>
+instead as a class member. The solution above is a solution that works
+for fixed length arrays that do not grow or shrink and saves you a pointer
+to the array itself but at a cost of being fairly more complex code so its
+usefulness is rather limited. It should work perfectly for literal constant
+strings for example. Have length and maybe hash code in the class and then
+access the string as "this + 1". As the string is assumed to be constant
+it doesn't matter that it is fixed length. The "variable" in variable length
+string here refers to the fact that different instances of this class
+will have different length but once created the length is fixed and do
+not change. If you want to append to the string you create a new string
+with room for the original plus the data appended and forgets the original
+string. In this case, the above solution would work just fine and having
+the object have gcobj as base class means the strings are allocated on heap
+and is garbage collected. You can even base it on gcobjdata as a string
+has no pointers on its own.
+
+template <typename ChT>
+class constant_string : public gc::gcdataobj {
+public:
+    typedef ChT char_type;
+
+    static constant_string * create(const char_type * s, std::size_t n);
+
+    std::size_t length() const { return n_; }
+    std::size_t hash() const { return h_; }
+
+    static std::size_t hash(const char_type * s, std::size_t n);
+
+    const char_type * str() const
+    { return reinterpret_cast<char_type *>(this + 1); }
+
+private:
+
+    char_type * wstr() { return reinterpret_cast<char_type *>(this + 1); }
+
+    constant_string(const char_type * s, std::size_t n)
+       : n_(n), h_(hash(s, n))
+    { std::memcpy(wstr(), s, n*sizeof(char_type)); S_[h_] = this; }
+
+    void * operator new(std::size_t sz, std::size_t n)
+    { return gcobj::operator new(sz + n*sizeof(char_type)); }
+
+    static data<string_map> S_;
+
+    std::size_t n_;
+    std::size_t h_;
+};
+

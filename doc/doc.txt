@@ -1,0 +1,437 @@
+
+First some definitions:
+
+managed class = gcobj or a class that has one and only one non-virtual
+parent class or base class that is a managed class.
+
+unmanaged class = any class that has no managed classes among its parents.
+
+Classes that have two or more parent classes that are gcobj will fail.
+Classes with virtual managed classes will fail
+
+managed object = an object instance of a managed class.
+
+gc's main entry point are the following functions:
+
+void * gcobj::operator new(std::size_t sz);
+
+This allocates a new managed object.
+
+void gcobj::operator delete(void * p);
+
+deletes a managed object - you normally never have to use this one, gc
+will delete the objects for you.
+
+// declare a top level root pointer p like this:
+// Foo must be a managed class.
+pointer<Foo> p;
+
+// alternatively, if you have a top level non-managed class or struct
+// named Bar you can declare this object as:
+data<Bar> d("d");
+
+Bar must have a static function declared as:
+
+static void gc_walker(const std::string & txt, Bar & d);
+
+if Bar has arguments to the constructor they are given after the text:
+
+data<Bar> blah("blah", 1, 3.14, "hello", ...);
+
+The text is meant to identify the object and will be the top level
+identifier if an error causes GC to print out the path to a pointer.
+Use a text that allow you to easily know which pointer path leads to
+the faulty pointer. Using a text containing the name of the variable,
+possibly additional info such as filename if not too long and line number
+is a good thing. If filename is short, using __FILE__ and __LINE__ in
+the construction of the text will do that.
+If filename is long, a substantial part of the path will be the filename,
+so be careful if name is very long.
+
+You can declare weak pointers by:
+
+weak_pointer<Foo> wp;
+
+wp is now a weak pointer to a managed class Foo object.
+
+When you write the gc_walker function for a class that contain a weak
+pointer don't gc_walk to that pointer - that's the whole point with
+weak pointers - they are not followed to find reachable objects. However,
+they are updated if the object moves or is removed. That is done by
+a mechanism other than the gc_walk though it is done by virtue of the
+weak pointer being registered.
+
+The pool area is divided into blocks, each allocation result in one single
+block which consists of the following:
+
+HEAD USEROBJECT GAP TAIL
+
+HEAD is an area reserved by GC to keep track of stuff. There is also a part
+after the head proper before the userobject filled with dummy data to protect
+the header from accidental modification by user.
+
+USEROBJECT is the object received by user when he calls new Foo(...); The
+size of this area is exactly the number of bytes that user asked for.
+
+GAP is 0 or more bytes after the user object before the tail.
+We require a minimum size for allocation, if user request less than that
+we pretend he asked for more and place those extra bytes in the gap.
+
+Also, if user asked for a number of bytes that is not a number divisible by
+sizeof(std::size_t) then we increase the gap by enough bytes to make the
+allocation a multiple of sizeof(std::size_t).
+
+All in all this ensures that the area between HEAD and TAIL is always a
+multiple of sizeof(std::size_t) and is also a certain minimum size
+so that we can place various objects in that region when the block is not
+used by user. When the block is used by user, this, USEROBJECT is fully
+reserved by them and GC doesn't touch that area.
+
+TAIL contains some buffer bytes between the start of TAIL (end of user area)
+and start of the TAIL proper. The proper tail only contain two pieces of
+data atm - the size of the block and a magic value that is used to guard
+against corruption.
+
+Having the size stored in both HEAD and TAIL allow you to both go backward and forward to next and previous block from any block.
+
+The minipool
+-------------------
+
+We have a minipool which does the actual allocation and it has essentially
+a pointer to the area where allocation takes place and a size of the total
+pool as well as size of the part we have used so far.
+
+The area used so far is essentially a sequence of blocks as described above.
+
+The area not yet used is blank.
+
+When asked to allocate n bytes, we check to see if we have n bytes available
+in the minipool, if we do not the allocation will fail. This will typically
+trigger some action by the pool that owns this minipool and I will get back
+to what happens when I describe those pools.
+
+If we do have enough bytes, i.e. used_space + n <= total_space, then
+we get a pointer to the first byte of unused space: bp = p + used_space. That
+will be the beginning of our new block and we update the used_space by n
+bytes so that next allocation will take place after this block.
+
+We then initialize the block as described earlier as a HEAD USEROBJECT GAP and
+TAIL. We then return a pointer to the USEROBJECT part of the block to caller.
+
+A minipool can be resized but in the current implementation it never does.
+Resizing of the pools is handled by the pool that owns the minipool and differ
+between them.
+
+The pools
+--------------
+
+We have a total of 6 pools in GC. The primary of these is GCpool which
+contains the pool that is normally used when allocating objects.
+
+GCpool
+----------
+
+GCpool has two minipools and it alternates between them. One pool is
+active and the other is inactive. When you do a gc() The first thing
+GCpool will do is swap active and inactive pool. This means that all
+the objects in his pool is then in the inactive minipool and the active
+minipool is empty. It then starts gc_walk through all live objects. This
+is done by calling gc_walk to various pools, the PtrPool to get root
+level pointers (pointer<Foo> p), the FPtrPool to get the top level
+data objects (data<Bar> d) and also Fpool since any frozen object
+is also by definition reachable regardless of what pointers are pointing
+to it or not.
+
+During this walk, any object found in the inactive pool is moved over
+to the active pool and in the place where the object was in the inactive
+pool we place a gc::moved object. gc::moved is a gc::gcobj that identifies
+that this object has moved and contain pointers to where it has moved to.
+This is so that if gc_walk stumble upon the same object again it will see
+that it has moved and report the new location so that user can update
+his pointer.
+
+After gc is done, any object not moved from the inactive pool to the active
+pool are by definition unreachable and will be reclaimed by GC.
+
+After gc_walk is done we then go through each pool to see if there are any
+objects that needs to be removed. We check the inactive pool and remove
+any objects that are neither gc::moved nor gc::removed and we also
+call Lpool::gc_cleanup() to mark unreachable objects in Lpool. We do not
+delete them yet, just mark them as deleted.
+
+Now, that we have done all that, we need to update the weak pointers, if
+any of them pointed to an object that has moved or been removed, we
+need to fix that pointer. This is done by calling
+WPtrPool::gc_update_pointers(). When that is done, we can delete the objects
+in Lpool that was marked as deleted previously and we're done.
+
+Some times we know that no object was deleted or marked for deletion
+and we only need to update pointers, for this purpose there is a
+"light-weight" gc that does exactly that: gc::gc_update_pointers(); It
+does NOT do gc_walk and therefore will not update regular pointers but
+it does update weak pointers and all registered pointers and data.
+
+Allocation
+------------
+First try to allocate an object from active pool. If that fails, do a
+gc() and try again. If that too fails, resize the pool and try again.
+If it fails after resizing the pool we throw a gc_allocation_error exception.
+
+This means that new never returns a 0 pointer.
+
+Deallocation
+-------------
+deleting an object simply means to mark the block as removed and replace
+the object found there with an instance of gc::removed.
+
+freeze
+-----------
+
+To freeze an object means to move it from GCpool to Fpool. Fpool never
+removes objects by GC. User can request to delete a frozen object but GC
+will never do so on its own. User can freeze an already frozen object, it
+will just increase a counter so that you have to unfreeze the object
+as many times as you froze it.
+
+Once you unfreeze the object so that the frozen counter reaches 0, the
+object is moved back to GCpool.
+
+resizing
+--------
+Resizing gc pool is fairly complex because both minipools must as a general
+rule have the same size and we typically allocate space for both pools
+when we allocate space for them so this is done as follows:
+
+First we allocate the new space which has room for both minipools and also
+a 1K buffer before and after and between each of the two pools. I.e. 3K
+buffer in total. We also always assign the first pool to A_ and the second
+pool to B_. However, we don't assign to any of them yet.
+
+We then check to see which is active, if A_ is the active pool then we
+do the following:
+
+A1. Assign the new pool to B_ (the inactive pool). B_ gets the second pool
+space.
+
+A2. Do a gc::gc(), this will move objects from A_ to B_ and should work fine
+since resizing is always to a larger pool space so B_'s pool is greater
+than A_'s.
+
+A3. Then B_ is active pool and A_ is the inactive and we assign the
+new pool to A_.
+
+A4. We dispose of the old pool.
+
+If instead it is B_ that is the active pool we do the following:
+
+B1. Assign the new pool to A_. A_ gets the first pool space.
+
+B2. do a gc::gc(). This will move objects from B_ to A_.
+
+B3. Then A_ is the active pool and we assign the new pool to B_.
+
+B4. we dispose of the old pool.
+
+As a special case, neither pool is active initially and in that
+case we also do not have any original pool, so we simply do.
+
+Assign the pool to A_ and B_ and set A_ as the active pool.
+
+Fpool
+-----------
+
+Fpool uses a minipool just as GCpool does. However, instead of having
+two minipools it has a list of minipools. This is because once an object
+is frozen we never move it, so if Fpool need more space it creates a new
+minipool and adds it to its list and never resizes an existing minipool
+It also keep track of a freelist  where it merges two consecutive blocks
+when they are both free. When freezing a new object Fpool will first check
+to see if there is a block in freelist that has room for the new object.
+If it has lots of room it will split the block first. If no block is
+found it tries to allocate a new block from the unused part of the
+minipool and if no minipool has room it will create a new minipool
+and allocate the object from there.
+
+Since frozen objects are defined as reachable, gc_walk will also start from
+those objects as if they had a root pointer pointing to them. Objects pointed
+to by a frozen object will therefore never go away. This gc_walk is
+done similarly to how cleanup is done in GCpool, by walking the pool
+and any object found in it, we call the gc_walker virtual function and
+with the text "Frozen object".
+
+Lpool
+----------------------
+
+Some times you allocate huge objects that aren't suitable to move around
+between two pools the way GCpool does it. For this case we have a large pool
+or pool for large objects called Lpool.
+
+There is a variable which can be set by user and any new that asks for more
+or equal bytes than given by that variable will cause the allocation to
+go to Lpool rather than GCpool.
+
+Objects in Lpool never moves around but they can still be frozen and unfrozen.
+It is simply a counter that goes up and down. It never drops below 0,
+unfrezing an object that isn't frozen does nothing.
+
+However, Lpool does not use a minipool. Instead each allocation is one
+single block. head::next_head() does not give you a pointer to a new block
+in Lpool, instead it gives you the end of the current block only.
+Lpool has a table with data for each allocation.
+
+Lpool objects can and will be garbage collected. After gc_walk is done and
+marked every block reached, gc() will call Lpool::gc_cleanup to
+mark each block as removed. However, we do not remove them yet as
+weak pointer update needs the object to still be around. After
+WPtrPool::gc_update_pointers() is called, we call Lpool::gc_cleanup2()
+to actually remove the objects marked for deletion.
+
+PtrPool
+------------
+PtrPool is simply a table for the pointer<Foo> regisrations. Every
+pointer<Foo> p; gets an entry in PtrPool with a pointer to the pointer
+in question. We also check to see if that pointer is in a block allocated
+by GCpool, Fpool or Lpool and if so remember the pointer to the HEAD of
+the block. For pointers that are declared outside of managed objects, that
+pointer is 0. When an object move, we call PtrPool.update_pp(old, new, delta)
+where old is the old block pointer, new is the new block pointer and delta
+is the signed difference between them. We then walk through the PtrPool
+table and any registration that has old pointer associated with it
+will then be updated to the new block and the pointer to the pointer
+is updated so that it points to where the pointer is now.
+
+This means that a pointer<Foo> defined inside a gcobj which was registered
+to be at some location will get that registration updated as the object
+moves around.
+
+Similar logic is applied if the block moves due to the object being frozen
+or unfrozen. Lpool objects never moves so their registrations are never
+updated.
+
+FPtrPool
+------------
+
+FPtrPool is similar to PtrPool but in addition to a pointer to data we also
+have a function that is assumed to be the gc_walker function for those data.
+
+When we do FPtrPool::gc_walk() we call each of these functions for each
+of these objects.
+
+Similar update is done as is described for PtrPool and is done by
+calling FPtrPool::update_pp().
+
+WPtrPool
+------------
+WPtrPool is similar to PtrPool and FPtrPool but is used somewhat differently.
+Also, we assume that PtrPool and FPtrPools are typically small - how many
+root level pointers do you need?
+
+WPtrPool is the pool for weak pointers and you may have lots of them and
+that alone is a significant difference. Also, while root pointers and objects
+only occasionally is found inside managed objects, weak pointers are assumed
+to be quite regularly found inside managed objects.
+
+I am contemplating changing this into a unordered_map where you using
+the block pointer as key gets you a table of all registrations for that block.
+Be aware that the one with 0 pointer block (any pointer not in any block)
+will probably be large while all those with non-zero block pointers will
+be very small. However, currently, it is not a map but a simple sorted list
+sorted on the address of the pointer. However, this causes a problem when the
+address is updated as that require us to rearrange the table.
+
+Also, the gc_update_pointers() function walks through this list and examines
+each pointer and checks the status of the block. This is the reason why
+Lpool::gc_cleanup() cannot delete the object yet. If the block is marked as
+removed we simply set the pointer to 0, if the block has moved either by
+GC or by freeze or unfreeze we update the pointer to the new location.
+
+However, it is crucial that before we do that, that the pointers themselves
+has been updated, which is why GC updates each pointer for every block
+it moves when it moves that block.
+
+Some notes on gc_walker functions.
+----------------------------------
+Simple example first:
+
+class A : public gc::gcobj {
+public:
+   /* some interface here */
+   virtual void gc_walker(const std::string & txt);
+private:
+   A * another;
+   A * and_another;
+};
+
+void A::gc_walker(const std::string & txt)
+{
+   gc_walk(".another",another);
+   gc_walk(".and_another", and_another);
+}
+
+Slightly more complex:
+
+struct B {
+   B * next;
+   A * aptr;
+};
+
+class C : public gc::gcobj {
+public:
+    /* some interface here */
+    virtual void gc_walker(const std::string & txt);
+private:
+    B * first;
+    B * last;
+    A * acur;
+    B * cur;
+};
+
+void C::gc_walker(const std::string & txt)
+{
+    char buf[40];
+
+    gc_walk(txt + ".acur", acur);
+
+    B * p = first;
+    int k = 0;
+
+    while (p) {
+        sprintf(buf, ".list[%d]", k++);
+	gc_walk(txt + buf, p->aptr);
+	p = p->next;
+    }
+    // provided cur and last is either 0 or pointing into the list
+    // we have already covered each element here and don't need to
+    // update cur, cur points to an unmanaged object (B) anyway
+    // so it will not move around and the pointer cur does
+    // not need to be udpated as the code is written here.
+}
+
+If you have managed pointers in an STL container you can do this:
+
+void D::gc_walker(const std::string & txt)
+{
+    char buf[40];
+    int k = 0;
+
+    std::list<A *>::iterator p = MyList.begin();
+    while (p != MyList.end()) {
+        sprintf(buf, ".MyList[%d]", k++);
+	gc_walk(txt + buf, *p);
+	++p;
+    }
+}
+
+Ditto for std::vector or whatever iterable data structure you have.
+
+If the list elements are your own struct (not managed), you pick
+the managed class pointers from the object and do gc_walk on that element.
+Alternatively you can declare a regular gc_walker function for that struct
+and simply call it from a gc_walker function that you declare for that struct
+or class. This function is not called by gc since the class or struct is not
+a managed class or struct but you can call it yourself from the gc_walker
+function of a managed class or struct that has pointer or embedded object
+in question.
+
+
+
