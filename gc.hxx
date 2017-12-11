@@ -113,9 +113,9 @@ register_obj(const std::string & txt,
 	     T & d,
 	     void f(const std::string &, T &))
 {
-  typedef void walk_func(const std::string &, T &);
+  typedef void walk_func(const std::string &, void *);
 
-  register_obj_(txt, & d, reinterpret_cast<walk_func *>(f));
+  register_obj_(txt, & d, reinterpret_cast<walk_func>(f));
 }
 
 template <typename T>
@@ -125,7 +125,21 @@ register_obj(const std::string & txt,
 	     T * p,
 	     void f(const std::string &, T *))
 {
-  register_obj_(txt, p, f);
+  typedef void walk_func(const std::string &, void *);
+
+  register_obj_(txt, p, reinterpret_cast<walk_func>(f));
+}
+
+template <typename T>
+inline
+void
+register_obj(const std::string & txt,
+	     T * p,
+	     void f(const std::string &, T &))
+{
+  typedef void walk_func(const std::string &, void *);
+
+  register_obj_(txt, p, reinterpret_cast<walk_func>(f));
 }
 
 // T is some struct or class that does not have gcobj as baseclass.
@@ -412,6 +426,45 @@ void gc_walk(const std::string &, weak_pointer<T> &)
 //    This text can be used in error detection and can be used to figure
 //    out exactly which pointer is wrong if for example a dangling pointer
 //    is detected.
+
+template <typename T>
+struct data;
+
+template <typename T>
+inline
+void
+register_obj(const std::string & txt,
+	     data<T> & d,
+	     void f(const std::string &, T &))
+{
+  typedef void walk_func(const std::string &, void *);
+
+  register_obj_(txt, & d, reinterpret_cast<walk_func *>(f));
+}
+
+template <typename T>
+inline
+void
+register_obj(const std::string & txt,
+	     data<T> * p,
+	     void f(const std::string &, T &))
+{
+  typedef void walk_func(const std::string &, void *);
+
+  register_obj_(txt, p, reinterpret_cast<walk_func *>(f));
+}
+
+template <typename T>
+inline
+void
+register_obj(const std::string & txt,
+	     data<T> * p,
+	     void f(const std::string &, T *))
+{
+  typedef void walk_func(const std::string &, void *);
+
+  register_obj_(txt, p, reinterpret_cast<walk_func *>(f));
+}
 
 template <typename T>
 struct data : public T {
